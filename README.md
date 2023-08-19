@@ -7,7 +7,7 @@ Bitwarden integration for Ansible.
 The easiest way to install this lookup plugin is to use the
 `ansible-galaxy` command:
 
-    ansible-galaxy install git+https://github.com/c0sco/ansible-modules-bitwarden
+    ansible-galaxy install git+https://github.com/tbleier/ansible-modules-bitwarden
 
 This will place the `ansible-modules-bitwarden` role into
 `$HOME/.ansible/roles`, where it will be available to all playbooks
@@ -27,6 +27,37 @@ followed by the items you want to retrieve. The default field is
 `password`, but any other field can be specified using the `field`
 named argument. If you need to specify the path to the Bitwarden CLI
 binary, use the `path` named argument.
+
+Additional parameters:
+
+- type:
+  - description: field type to fetch ('default' for username/password, 'custom' for custom fields, 'attachment' for attachments)
+  - default: 'default'
+
+- organization:
+  - description: optional name of organization - if specified, only entries in this org are found.
+  - default: None
+
+- collection:
+  - description: optional name or collection - if specified, only entries in this collection are found.
+  - default: None
+
+- create:
+  - description: create the item if it does not exis (in this organization/collection). Only supports type='default' and
+     username and password fields. Creates a random password/username for this entry. Can only create either username
+     or password
+  - default: False
+- length:
+  - description: length of created password/username
+  - default: 20
+
+- chars:
+  - description: character sets to use for random password generation. similar to 'password' lookup plugin
+  - default: ['ascii_letters', 'digits', ".,:-_"]
+
+- template:
+  - description: additional template to use for new entry. See bitwarden documentation for more details
+  - default: None
 
 ## Examples
 
@@ -62,6 +93,30 @@ TASK [debug] *********************************************************
 ok: [localhost] => {
     "msg": "alice"
     }
+```
+
+### Get a single password use organization and collection
+
+```
+---
+- hosts: localhost
+  roles:
+    - ansible-modules-bitwarden
+  tasks:
+    - debug:
+        msg: "{{ lookup('bitwarden', 'google', field='password', organization='my org', collection='shared accounts', sync=True) }}"
+```
+
+The above might result in:
+
+```
+TASK [Gathering Facts] *********************************************************
+ok: [localhost]
+
+TASK [debug] *********************************************************
+ok: [localhost] => {
+    "msg": "mysecret"
+}
 ```
 
 ### See all available fields

@@ -13,12 +13,21 @@ __metaclass__ = type
 import json
 import os
 import sys
+import string
+import copy
 import logging
 
 from subprocess import Popen, PIPE, STDOUT, check_output
+from base64 import b64encode
 
 from ansible.errors import AnsibleError
 from ansible.plugins.lookup import LookupBase
+from ansible.module_utils.six import string_types
+from ansible.module_utils.common.text.converters import to_native, to_text
+from ansible.utils.encrypt import random_password
+
+VALID_PARAMS = frozenset(('path', 'session', 'sync', 'field', 'type', 'organization', 'collection', 
+                          'create', 'length', 'chars', 'template'))
 
 try:
     from __main__ import display
@@ -31,25 +40,53 @@ DOCUMENTATION = """
 lookup: bitwarden
 author:
   - Matt Stofko <matt@mjslabs.com>
+  - City Network International AB - https://github.com/citynetwork
+  - https://github.com/timvy
+  - Thomas Bleier <thomas@bleier.at>
 requirements:
   - bw (command line utility)
   - BW_SESSION environment var (from `bw login` or `bw unlock`)
-short_description: look up data from a bitwarden vault
+short_description: look up or create entries using a bitwarden vault
 description:
   - use the bw command line utility to grab one or more items stored in a
-    bitwarden vault
+    bitwarden vault, optionally also creating new entries
 options:
   _terms:
-    description: name of item that contains the field to fetch
+    description: name of item that contains the field to fetch (exact match)
     required: true
 field:
   description: field to return from bitwarden
   default: 'password'
-custom_field:
-  description: If True, look up named field in custom fields instead
-      of top-level dictionary.
 sync:
   description: If True, call `bw sync` before lookup
+path:
+  description: optional path to bitwarden cli binary
+  default: bw
+session:
+  description: override session id
+type:
+  description: field type to fetch ('default' for username/password, 'custom' for custom fields, 'attachment' for attachments)
+  default: 'default'
+organization:
+  description: optional name of organization - if specified, only entries in this org are found.
+  default: None
+collection:
+  description: optional name or collection - if specified, only entries in this collection are found.
+  default: None
+create:
+  description: create the item if it does not exis (in this organization/collection). Only supports type='default' and
+     username and password fields. Creates a random password/username for this entry. Can only create either username
+     or password
+  default: False
+length:
+  description: length of created password/username
+  default: 20
+chars:
+  description: character sets to use for random password generation. similar to 'password' lookup plugin
+  default: ['ascii_letters', 'digits', ".,:-_"]
+template:
+  description: additional template to use for new entry. See bitwarden documentation for more details
+  default: None
 """
 
 EXAMPLES = """
@@ -192,16 +229,88 @@ class Bitwarden(object):
                 return(collection['id'])
         raise AnsibleError("Error getting collection - collection not found: %s" % name)
 
+    def _gen_candidate_chars(self, characters):
+        '''Generate a string containing all valid chars as defined by ``characters``
+        copied from https://github.com/ansible/ansible/blob/devel/lib/ansible/plugins/lookup/password.py
+
+        :arg characters: A list of character specs. The character specs are
+            shorthand names for sets of characters like 'digits', 'ascii_letters',
+            or 'punctuation' or a string to be included verbatim.
+
+        The values of each char spec can be:
+
+        * a name of an attribute in the 'strings' module ('digits' for example).
+        The value of the attribute will be added to the candidate chars.
+        * a string of characters. If the string isn't an attribute in 'string'
+        module, the string will be directly added to the candidate chars.
+
+        For example::
+
+            characters=['digits', '?|']``
+
+        will match ``string.digits`` and add all ascii digits.  ``'?|'`` will add
+        the question mark and pipe characters directly. Return will be the string::
+
+            u'0123456789?|'
+        '''
+        chars = []
+        for chars_spec in characters:
+            # getattr from string expands things like "ascii_letters" and "digits"
+            # into a set of characters.
+            chars.append(to_text(getattr(string, to_native(chars_spec), chars_spec), errors='strict'))
+        chars = u''.join(chars).replace(u'"', u'').replace(u"'", u'')
+        return chars
+
+    def create_entry(self, name, type, field, organizationId, collectionId, length, pwchars, template):
+        chars = self._gen_candidate_chars(pwchars)
+        new_entry = random_password(length, chars)
+        debug(f'Creating new password: {length} chars {str(pwchars)}: {new_entry}')
+        # create new item by getting JSON template from bitwarden
+        new_item = json.loads(self._run(['get', 'template', 'item']))
+        if not isinstance(new_item, dict):
+            raise AnsibleError(f'Error - got invalid template for new item from Bitwarden CLI!')
+        # Replace bw default note (which is 'Some notes about this item')
+        if 'notes' in new_item:
+            new_item['notes'] = 'Created with ansible-modules-bitwarden'            
+        if template is None:
+            template = {}
+        if isinstance(template, string_types):
+            try:
+                template = json.loads(template)
+            except json.decoder.JSONDecodeError as e:
+                raise AnsibleError(f"Error decoding new item template: {repr(e)}")
+        if not isinstance(template, dict):
+            raise AnsibleError(f'Invalid template - has to be a dict!')
+        for key, value in template.items():
+            new_item[key] = value
+        new_item['name'] = name
+        if field == 'username':
+            password = template['login']['password'] if 'login' in template and 'password' in template['login'] else ''
+            new_item['login'] = {'username':new_entry, 'password': password}
+        elif field == 'password':
+            username = template['login']['username'] if 'login' in template and 'username' in template['login'] else ''
+            new_item['login'] = {'username':username, 'password': new_entry}
+        else:
+            raise AnsibleError(f'Create is only supported for username and password fields')
+        if organizationId is not None:
+            new_item['organizationId'] = organizationId
+        if collectionId is not None:
+            if new_item['collectionIds'] is not None:
+                new_item['collectionIds'].append(collectionId)
+            else:
+                new_item['collectionIds'] = [ collectionId ]
+        debug(f'New item: {new_item}')
+        self._run(['create', 'item', b64encode(json.dumps(new_item).encode('ascii'))])
+        return new_entry
+
     @cache
-    def get_entry(self, key, field, organizationId=None, collectionId=None, type='default'):
+    def get_entry(self, key, field, organizationId, collectionId, type, create, length, pwchars, template):
         try:
             data = json.loads(self._run(['list', 'items', '--search', key]))
         except json.decoder.JSONDecodeError as e:
             raise AnsibleError("Error decoding Bitwarden list items: %s" % e)
         if not isinstance(data, list):
             raise AnsibleError("Error getting items list: no items list")
-        if len(data) == 0:
-            raise AnsibleError(f"Error getting entry: item '{key}' not found")        
         _return = []
         for result in data:
             if 'id' in result.keys() and 'name' in result.keys() and 'collectionIds' in result.keys() and 'organizationId' in result.keys():
@@ -231,11 +340,16 @@ class Bitwarden(object):
                             _return.append(self._run(['get', 'attachment', x['id'], '--quiet', '--raw', '--output', '/dev/stdout', '--itemid', result['id']]))
                 elif type == 'default' and field in result.keys():
                     _return.append(result[field])
+        debug(f'get_entry: {str(_return)}')
         if len(_return) > 1:
             raise AnsibleError(f"Error getting entry: more then one item found for: {key}")
         elif len(_return) == 1:
             return _return[0]
-        raise AnsibleError(f"Error getting entry: item '{key}' not found!")
+        else:
+            if create:
+                return self.create_entry(key, type, field, organizationId, collectionId, length, pwchars, template)
+            else:
+                raise AnsibleError(f"Error getting entry: item '{key}' not found!")
 
 
 class LookupModule(LookupBase):
@@ -245,6 +359,10 @@ class LookupModule(LookupBase):
 
         debug(f'Lookup: {", ".join(terms)}')
         debug(f'Options: {", ".join(f"{key}={value}" for key, value in kwargs.items())}')
+
+        invalid_params = frozenset(kwargs.keys()).difference(VALID_PARAMS)
+        if invalid_params:
+            raise AnsibleError('Unrecognized parameter(s) given to password lookup: %s' % ', '.join(invalid_params))
 
         if not bw:
             bw = Bitwarden(path=kwargs.get('path', 'bw'))
@@ -263,7 +381,15 @@ class LookupModule(LookupBase):
         organization = kwargs.get('organization', None)
         organizationId = None
         collection = kwargs.get('collection', None)
-        collectionId = None        
+        collectionId = None
+        create = kwargs.get('create', None)
+        if create and type not in ['default']:
+            raise AnsibleError('Create only supported for "default" type!')
+        length = kwargs.get('length', 20)
+        if isinstance(length, string_types):
+            length = int(length)
+        pwchars = kwargs.get('chars', ['ascii_letters', 'digits', ".,:-_"])
+        template = kwargs.get('template', None)
         values = []
         if organization != None:
             organizationId = bw.organization(organization)
@@ -271,7 +397,7 @@ class LookupModule(LookupBase):
             collectionId = bw.collection(collection)        
 
         for term in terms:
-            values.append(bw.get_entry(term, field, organizationId, collectionId, type))
+            values.append(bw.get_entry(term, field, organizationId, collectionId, type, create, length, pwchars, template))
         return values
 
 
