@@ -3,14 +3,18 @@
   ansible.builtin.command:
     cmd: bw sync
   delegate_to: localhost
+  become: false
   run_once: true
+  changed_when: false
 
 - name: get bitwarden status
   ansible.builtin.command:
     cmd: bw status
   register: bw_status
   delegate_to: localhost
+  become: false
   run_once: true
+  changed_when: false
 
 - name: assert bitwarden vault is unlocked
   ansible.builtin.assert:
