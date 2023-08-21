@@ -1,6 +1,6 @@
 # ansible-modules-bitwarden
 
-Bitwarden integration for Ansible.
+Bitwarden integration for Ansible. For of https://github.com/c0sco/ansible-modules-bitwarden that integrates some pull requests from others (handling of organization and collections and caching) and implements creation of items in Bitwarden.
 
 ## Installation
 
@@ -22,13 +22,18 @@ in your play.  For example:
       roles:
         - ansible-modules-bitwarden
 
-Use Ansible's `lookup()` function with the `bitwarden` argument,
-followed by the items you want to retrieve. The default field is
+Use Ansible's `lookup()` function with the `bitwarden` argument, followed by the items you want to retrieve. 
+
+The default field is
 `password`, but any other field can be specified using the `field`
 named argument. If you need to specify the path to the Bitwarden CLI
 binary, use the `path` named argument.
 
 Additional parameters:
+
+- field:
+  - description: field name to fetch
+  - default: 'password'
 
 - type:
   - description: field type to fetch ('default' for username/password, 'custom' for custom fields, 'attachment' for attachments)
@@ -42,11 +47,24 @@ Additional parameters:
   - description: optional name or collection - if specified, only entries in this collection are found.
   - default: None
 
+- sync:
+  - description: If True, call `bw sync` before lookup
+  - default: False
+
+- path:
+  - description: optional path to bitwarden cli binary
+  - default: bw
+
+- session:
+  - description: override session id (otherwise specify in environment variable - see bitwarden CLI docs)
+  - default: None
+
 - create:
   - description: create the item if it does not exis (in this organization/collection). Only supports type='default' and
      username and password fields. Creates a random password/username for this entry. Can only create either username
      or password
   - default: False
+
 - length:
   - description: length of created password/username
   - default: 20
@@ -95,7 +113,7 @@ ok: [localhost] => {
     }
 ```
 
-### Get a single password use organization and collection
+### Get a single password from a specific organization and collection
 
 ```
 ---
@@ -118,6 +136,42 @@ ok: [localhost] => {
     "msg": "mysecret"
 }
 ```
+
+### Get a single password, create a new random one if it does not exist
+
+```
+---
+- hosts: localhost
+  roles:
+    - ansible-modules-bitwarden
+  tasks:
+    - name: Prepare bitwarden template
+    set_fact:
+        bw_tmpl:
+        notes: |
+            Created by {{ lookup('ansible.builtin.env','USER') }}@{{lookup('pipe','hostname')}} 
+            on {{ lookup('pipe', 'date "+%F %T"') }}
+            for {{ inventory_hostname }}
+        login:
+            username: "admin"
+    delegate_to: localhost
+
+    - name: "Get/create admin password from bitwarden"
+    set_fact:
+        _admin_pwd: >-
+        {{ lookup(
+                'bitwarden',
+                'admin password for ' + inventory_hostname,
+                organization='my_org',
+                collection='admin passwords',
+                create=True,
+                template=bw_tmpl
+            ) }}
+    no_log: True
+    delegate_to: localhost
+    become: False  
+```
+
 
 ### See all available fields
 
